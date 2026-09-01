@@ -288,6 +288,28 @@
 (ert-deftest emcp-test-obj-drops-nil ()
   (should (equal (emcp-obj 'a 1 'b nil 'c 2) '((a . 1) (c . 2)))))
 
+(ert-deftest emcp-test-get-normalizes-null ()
+  "JSON null must read as absent (regression: nextCursor null loop)."
+  (let ((parsed (emcp-util-json-parse
+                 "{\"nextCursor\": null, \"a\": {\"b\": null}}")))
+    (should-not (emcp-get parsed 'nextCursor))
+    (should-not (emcp-get parsed 'a 'b))
+    (should-not (emcp-get parsed 'missing))))
+
+(ert-deftest emcp-test-curl-config-rejects-crlf ()
+  "Header values with CR/LF must be refused (header injection)."
+  (should-error (emcp-curl--config-file '(("Authorization" . "Bearer x\r\nHost: evil")))
+                :type 'emcp-error)
+  (should-error (emcp-curl--config-file '(("Bad\nName" . "v")))
+                :type 'emcp-error)
+  (let ((file (emcp-curl--config-file '(("Authorization" . "Bearer \"q\"")))))
+    (unwind-protect
+        (with-temp-buffer
+          (insert-file-contents file)
+          (should (equal (buffer-string)
+                         "header = \"Authorization: Bearer \\\"q\\\"\"\n")))
+      (delete-file file))))
+
 (ert-deftest emcp-test-empty-object-serializes ()
   (should (equal (emcp-util-json-serialize emcp-util-empty-object) "{}")))
 

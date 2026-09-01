@@ -158,7 +158,9 @@
           ((emcp-connection-access-token conn))
           ((and (eq (emcp-connection-transport conn) 'http)
                 emcp-oauth-enabled)
-           (let ((token (emcp-oauth-access-token (emcp-connection-url conn))))
+           (let ((token (emcp-oauth-access-token
+                         (emcp-connection-url conn)
+                         (emcp-connection-oauth conn))))
              (setf (emcp-connection-access-token conn) token)
              token)))))
 
@@ -241,6 +243,9 @@ jsonrpc-error, http-error, transport-error."
                     conn id 'transport-error
                     "SSE stream ended without a response"))
                   ((and (>= status 200) (< status 300))
+                   ;; In the legacy-sse era the POST reply is only an
+                   ;; ack (e.g. 202 "Accepted"); the real response
+                   ;; arrives on the GET stream, so tolerate any body.
                    (if (string-empty-p (string-trim (or (plist-get r :body) "")))
                        (unless (eq (emcp-connection-era conn) 'legacy-sse)
                          (emcp--resolve-pending conn id 'transport-error
@@ -248,9 +253,11 @@ jsonrpc-error, http-error, transport-error."
                      (condition-case err
                          (dolist (m (emcp--parse-messages (plist-get r :body)))
                            (emcp--dispatch conn m on-notification))
-                       (error (emcp--resolve-pending
-                               conn id 'transport-error
-                               (format "Unparseable response: %S" err))))))
+                       (error
+                        (unless (eq (emcp-connection-era conn) 'legacy-sse)
+                          (emcp--resolve-pending
+                           conn id 'transport-error
+                           (format "Unparseable response: %S" err)))))))
                   (t
                    (emcp--resolve-pending
                     conn id 'http-error
@@ -499,7 +506,12 @@ HTTP transports (kill it to cancel), nil for stdio."
                             (when (emcp-get payload 'inputRequests)
                               (emcp--fulfill-input-requests
                                conn (emcp-get payload 'inputRequests))))
-                           (request-state (emcp-get payload 'requestState))
+                           ;; requestState is an opaque *string*; drop
+                           ;; anything else rather than corrupt it in
+                           ;; the parse/serialize round trip.
+                           (request-state
+                            (let ((rs (emcp-get payload 'requestState)))
+                              (and (stringp rs) rs)))
                            (next-params
                             (append
                              (emcp-obj 'inputResponses (or responses nil)
@@ -542,19 +554,30 @@ HTTP transports (kill it to cancel), nil for stdio."
    (emcp-util-header (plist-get payload :headers) "www-authenticate")))
 
 (defun emcp--auth-retry (conn method params payload step-up opts callback)
-  "Run the OAuth flow off the process-filter stack, then retry METHOD."
+  "Run the OAuth flow off the process-filter stack, then retry METHOD.
+On a plain 401, first try a silent refresh of the stored token; only
+fall back to the interactive browser flow when that yields nothing new."
   (run-at-time
    0 nil
    (lambda ()
      (condition-case err
          (let* ((challenge (emcp--challenge-of payload))
-                (token (if step-up
-                           (emcp-oauth-step-up (emcp-connection-url conn)
-                                               (emcp-connection-oauth conn)
-                                               challenge)
-                         (emcp-oauth-authorize (emcp-connection-url conn)
-                                               (emcp-connection-oauth conn)
-                                               challenge))))
+                (rejected (emcp-connection-access-token conn))
+                (token
+                 (or (and (not step-up)
+                          (progn
+                            (setf (emcp-connection-access-token conn) nil)
+                            (let ((fresh (emcp-oauth-access-token
+                                          (emcp-connection-url conn)
+                                          (emcp-connection-oauth conn))))
+                              (and fresh (not (equal fresh rejected)) fresh))))
+                     (if step-up
+                         (emcp-oauth-step-up (emcp-connection-url conn)
+                                             (emcp-connection-oauth conn)
+                                             challenge)
+                       (emcp-oauth-authorize (emcp-connection-url conn)
+                                             (emcp-connection-oauth conn)
+                                             challenge)))))
            (setf (emcp-connection-access-token conn) token)
            (apply #'emcp-request-async conn method params
                   (append opts (list :callback callback))))
@@ -595,9 +618,12 @@ connection once ready, or signalled data on failure)."
           (run-at-time
            0.05 nil
            (lambda ()
-             (emcp-curl-await
-              (lambda () (memq (emcp-connection-status conn) '(ready error)))
-              timeout "connect")
+             (condition-case err
+                 (emcp-curl-await
+                  (lambda ()
+                    (memq (emcp-connection-status conn) '(ready error)))
+                  timeout "connect")
+               (emcp-timeout (emcp--fail conn err)))
              (funcall callback conn)))
           conn)
       (emcp-curl-await
@@ -754,6 +780,7 @@ connection once ready, or signalled data on failure)."
   (setf (emcp-connection-era conn) 'modern
         (emcp-connection-protocol-version conn) emcp-protocol-version)
   (let* ((answered nil)
+         (fell-back nil)
          (timer nil))
     (emcp-request-async
      conn "server/discover" nil
@@ -761,23 +788,27 @@ connection once ready, or signalled data on failure)."
      (lambda (status payload)
        (setq answered t)
        (when timer (cancel-timer timer))
-       (pcase status
-         ('ok
-          (setf (emcp-connection-server-info conn)
-                (or (emcp-get payload 'serverInfo) payload)
-                (emcp-connection-server-capabilities conn)
-                (emcp-get payload 'capabilities)
-                (emcp-connection-status conn) 'ready))
-         ('jsonrpc-error
-          (if (eql (emcp-get payload 'code) -32022)
-              (emcp--discover-error conn payload)
-            (emcp--stdio-legacy-init conn)))
-         (_ (emcp--fail conn payload)))))
+       ;; The 5s timer may already have started the legacy handshake;
+       ;; a late probe reply must not fight it.
+       (unless fell-back
+         (pcase status
+           ('ok
+            (setf (emcp-connection-server-info conn)
+                  (or (emcp-get payload 'serverInfo) payload)
+                  (emcp-connection-server-capabilities conn)
+                  (emcp-get payload 'capabilities)
+                  (emcp-connection-status conn) 'ready))
+           ('jsonrpc-error
+            (if (eql (emcp-get payload 'code) -32022)
+                (emcp--discover-error conn payload)
+              (emcp--stdio-legacy-init conn)))
+           (_ (emcp--fail conn payload))))))
     (setq timer
           (run-at-time 5 nil
                        (lambda ()
                          (unless answered
                            ;; No reply to the probe: assume initialize era.
+                           (setq fell-back t)
                            (emcp--stdio-legacy-init conn)))))))
 
 (defun emcp--stdio-legacy-init (conn)
@@ -844,7 +875,8 @@ for header construction in `emcp-tools-call'."
       (setq first nil)
       (let ((result (emcp-request conn "tools/list"
                                   (when cursor (emcp-obj 'cursor cursor)))))
-        (setq cursor (emcp-get result 'nextCursor))
+        (setq cursor (let ((c (emcp-get result 'nextCursor)))
+                       (and (stringp c) c)))
         (dolist (tool (emcp-get result 'tools))
           (condition-case err
               (progn

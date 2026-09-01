@@ -269,12 +269,14 @@ Return the server process; its port is (process-contact PROC :service)."
            :refresh-token (if (stringp refresh) refresh fallback-refresh)
            :expires-at (and (numberp expires-in)
                             (+ (float-time) expires-in -60))
-           :scope (or (emcp-get token-response 'scope) scopes)
+           :scope (let ((s (emcp-get token-response 'scope)))
+                    (if (stringp s) s scopes))
            :issuer issuer))))
 
-(defun emcp-oauth-access-token (resource-url)
+(defun emcp-oauth-access-token (resource-url &optional config)
   "Return a valid access token for RESOURCE-URL, refreshing if possible.
-Return nil when there is no usable token."
+CONFIG is the connection's :oauth plist (used for client credentials
+during refresh).  Return nil when there is no usable token."
   (let* ((resource (emcp-util-canonical-resource resource-url))
          (saved (emcp-oauth--store-get resource)))
     (when saved
@@ -282,18 +284,23 @@ Return nil when there is no usable token."
             (expires-at (plist-get saved :expires-at)))
         (if (and token (or (null expires-at) (< (float-time) expires-at)))
             token
-          (emcp-oauth--refresh resource saved))))))
+          (emcp-oauth--refresh resource saved config))))))
 
-(defun emcp-oauth--refresh (resource saved)
-  "Refresh the token for RESOURCE using SAVED plist; return token or nil."
+(defun emcp-oauth--refresh (resource saved &optional config)
+  "Refresh the token for RESOURCE using SAVED plist; return token or nil.
+Client credentials come from CONFIG when set (pre-registered or CIMD
+clients), falling back to the persisted dynamic registration."
   (let ((refresh (plist-get saved :refresh-token))
         (issuer (plist-get saved :issuer)))
-    (when (and refresh issuer)
+    (when (and (stringp refresh) (stringp issuer))
       (condition-case nil
           (let* ((as-meta (emcp-oauth--discover-as issuer))
                  (client (emcp-oauth--store-get (concat "client:" issuer)))
-                 (client-id (plist-get client :client-id))
-                 (client-secret (plist-get client :client-secret))
+                 (client-id (or (plist-get config :client-id)
+                                (plist-get config :client-metadata-url)
+                                (plist-get client :client-id)))
+                 (client-secret (or (plist-get config :client-secret)
+                                    (plist-get client :client-secret)))
                  (reply (emcp-oauth--post-form
                          (emcp-get as-meta 'token_endpoint)
                          (delq nil
@@ -319,13 +326,14 @@ Priority: union with PREVIOUS of the CHALLENGE scope; else PRM
 scopes_supported; else CONFIG :scopes."
   (let* ((challenge-scope
           (cdr (assoc "scope" (plist-get challenge :params))))
+         (supported (emcp-get prm 'scopes_supported))
          (base (cond (challenge-scope challenge-scope)
-                     ((emcp-get prm 'scopes_supported)
-                      (mapconcat #'identity
-                                 (emcp-get prm 'scopes_supported) " "))
+                     ((and (listp supported) supported)
+                      (mapconcat (lambda (s) (format "%s" s)) supported " "))
                      ((plist-get config :scopes) (plist-get config :scopes))))
          (all (delete-dups
-               (append (and previous (split-string previous " " t))
+               (append (and (stringp previous)
+                            (split-string previous " " t))
                        (and base (split-string base " " t))))))
     (when all (mapconcat #'identity all " "))))
 
@@ -351,12 +359,21 @@ until the browser round-trip completes; returns the access token."
       (signal 'emcp-oauth-error
               (list "Configured issuer not offered by resource" issuer)))
     (let* ((as-meta (emcp-oauth--discover-as issuer))
+           (pkce-methods (emcp-get as-meta 'code_challenge_methods_supported))
            (result nil)
            (listener
             (emcp-oauth--start-loopback
              (lambda (query) (setq result query))))
            (port (process-contact listener :service))
            (redirect-uri (format "http://127.0.0.1:%d/callback" port)))
+      ;; PKCE downgrade protection: when the AS advertises its
+      ;; supported methods, S256 must be among them.
+      (when (and (listp pkce-methods) pkce-methods
+                 (not (member "S256" pkce-methods)))
+        (delete-process listener)
+        (signal 'emcp-oauth-error
+                (list "Authorization server does not support PKCE S256"
+                      issuer)))
       (unwind-protect
           (let* ((client (emcp-oauth--client-for issuer as-meta config
                                                  redirect-uri))

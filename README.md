@@ -127,6 +127,13 @@ and both stdio eras.
 - No `tasks` extension, no OpenTelemetry `_meta` propagation, no
   `ttlMs`/`cacheScope` caching (clients MAY cache; we refetch).
 - Elicitation URL mode is handled via `browse-url` + confirm only.
+- Dynamically registered clients pin the loopback redirect port from
+  the first authorization; ASes that ignore RFC 8252 §7.3 (variable
+  loopback ports) may reject later re-authorizations. Delete the
+  `client:<issuer>` entry from the plstore to re-register.
+- The process handle returned by `emcp-request-async` is the initial
+  request; if an OAuth retry replaces it, killing the original handle
+  no longer cancels the live request.
 
 ## License
 

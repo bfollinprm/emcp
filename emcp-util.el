@@ -49,9 +49,11 @@ Use :false for JSON false and vectors for arrays."
     (nreverse out)))
 
 (defun emcp-get (obj &rest keys)
-  "Look up nested symbol KEYS in parsed-JSON alist OBJ."
-  (dolist (k keys obj)
-    (setq obj (and (listp obj) (cdr (assq k obj))))))
+  "Look up nested symbol KEYS in parsed-JSON alist OBJ.
+JSON null (:null) is returned as nil, so absent and null look alike."
+  (dolist (k keys)
+    (setq obj (and (listp obj) (cdr (assq k obj)))))
+  (if (eq obj :null) nil obj))
 
 (defconst emcp-util-empty-object (make-hash-table :test 'equal :size 1)
   "Shared value that serializes to the empty JSON object {}.")

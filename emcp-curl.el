@@ -35,7 +35,34 @@
   sse-parser
   body-parts     ; reversed list of body chunks (non-stream)
   on-event on-headers callback
+  config-file    ; temp file carrying headers, deleted on exit
   done cancelled)
+
+(defun emcp-curl--config-file (headers)
+  "Write HEADERS to a 0600 temp curl config file; return its name.
+Keeps header values (e.g. bearer tokens) off the process command line.
+Signals `emcp-error' on CR/LF in a name or value (header injection)."
+  (let ((file (make-temp-file "emcp-curl" nil ".conf")))
+    (with-temp-file file
+      (dolist (kv headers)
+        (let ((name (format "%s" (car kv)))
+              (value (format "%s" (cdr kv))))
+          (when (or (string-match-p "[\r\n]" name)
+                    (string-match-p "[\r\n]" value))
+            (delete-file file)
+            (signal 'emcp-error
+                    (list "Refusing CR/LF in HTTP header" name)))
+          (insert "header = \""
+                  (replace-regexp-in-string
+                   "\"" "\\\\\""
+                   (replace-regexp-in-string
+                    "\\\\" "\\\\\\\\"
+                    ;; "Name:" with no value tells curl to drop the header.
+                    (if (string-empty-p value)
+                        (concat name ":")
+                      (concat name ": " value))))
+                  "\"\n"))))
+    file))
 
 (cl-defun emcp-curl (&key url (method "GET") headers body timeout
                           on-event on-headers callback)
@@ -48,19 +75,21 @@ the response head is parsed.  CALLBACK receives a plist: on success
 \(:status N :headers ALIST :body STRING :stream BOOL), on transport
 failure (:error MSG).  For SSE responses CALLBACK fires when the
 stream ends."
-  (let* ((args `("-sS" "-i" "--no-buffer"
+  (let* ((config-file (when headers
+                        (emcp-curl--config-file
+                         (cons '("Expect" . "") headers))))
+         (args `("-sS" "-i" "--no-buffer"
                  "--connect-timeout" ,(number-to-string emcp-curl-connect-timeout)
                  ,@(when timeout (list "--max-time" (number-to-string timeout)))
                  "-X" ,method
-                 ,@(cl-loop for (k . v) in headers
-                            append (list "-H" (format "%s: %s" k v)))
-                 "-H" "Expect:"
-                 ,@(when body (list "--data-binary" body))
+                 ,@(when config-file (list "--config" config-file))
+                 ;; Body arrives via stdin: no argv exposure or size limit.
+                 ,@(when body (list "--data-binary" "@-"))
                  ,url))
          (state (make-emcp-curl--state
                  :phase 'head :buf "" :body-parts nil
                  :on-event on-event :on-headers on-headers
-                 :callback callback))
+                 :callback callback :config-file config-file))
          (proc (make-process
                 :name "emcp-curl"
                 :command (cons emcp-curl-program args)
@@ -70,13 +99,24 @@ stream ends."
                 :filter #'emcp-curl--filter
                 :sentinel #'emcp-curl--sentinel)))
     (process-put proc 'emcp-curl-state state)
+    (when body
+      (process-send-string proc (if (multibyte-string-p body)
+                                    (encode-coding-string body 'utf-8)
+                                  body))
+      (process-send-eof proc))
     proc))
+
+(defun emcp-curl--cleanup (state)
+  (when-let* ((file (emcp-curl--state-config-file state)))
+    (setf (emcp-curl--state-config-file state) nil)
+    (ignore-errors (delete-file file))))
 
 (defun emcp-curl-cancel (proc)
   "Cancel the request PROC; no callbacks fire after this."
   (let ((state (process-get proc 'emcp-curl-state)))
     (when state
-      (setf (emcp-curl--state-cancelled state) t)))
+      (setf (emcp-curl--state-cancelled state) t)
+      (emcp-curl--cleanup state)))
   (when (process-live-p proc)
     (delete-process proc)))
 
@@ -124,6 +164,7 @@ stream ends."
 (defun emcp-curl--sentinel (proc _event)
   (when (memq (process-status proc) '(exit signal))
     (let ((state (process-get proc 'emcp-curl-state)))
+      (when state (emcp-curl--cleanup state))
       (when (and state
                  (not (emcp-curl--state-done state))
                  (not (emcp-curl--state-cancelled state)))
