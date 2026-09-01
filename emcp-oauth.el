@@ -60,10 +60,10 @@ default; point `plstore-encrypt-to' at a GPG key and set
 
 (defun emcp-oauth--store ()
   (unless emcp-oauth--store
-    ;; basic-save-buffer prompts to create a missing directory, which
-    ;; kills batch/noninteractive sessions; create it up front.
-    (let ((dir (file-name-directory emcp-oauth-store-file)))
-      (unless (file-directory-p dir) (make-directory dir t)))
+    ;; `plstore-save' prompts if the parent is missing, which fails in batch mode.
+    (let ((dir (file-name-directory (expand-file-name emcp-oauth-store-file))))
+      (unless (file-directory-p dir)
+        (make-directory dir t)))
     (setq emcp-oauth--store (plstore-open emcp-oauth-store-file))
     (ignore-errors (set-file-modes emcp-oauth-store-file #o600)))
   emcp-oauth--store)

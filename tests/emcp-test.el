@@ -153,6 +153,24 @@
   (should (equal (emcp-util-canonical-resource "http://localhost:8080/server/mcp")
                  "http://localhost:8080/server/mcp")))
 
+;;;; OAuth persistence
+
+(ert-deftest emcp-test-oauth-store-creates-parent-directory ()
+  (let* ((root (make-temp-file "emcp-oauth-store-test-" t))
+         (store-file (expand-file-name "missing/emcp-oauth.plstore" root))
+         (emcp-oauth-store-file store-file)
+         (emcp-oauth--store nil)
+         (emcp-oauth-use-secret-storage nil))
+    (unwind-protect
+        (progn
+          (emcp-oauth--store-put "resource" '(:access-token "token"))
+          (should (file-directory-p (file-name-directory store-file)))
+          (should (file-exists-p store-file)))
+      (setq emcp-oauth--store nil)
+      (when-let* ((buffer (find-buffer-visiting store-file)))
+        (kill-buffer buffer))
+      (delete-directory root t))))
+
 ;;;; Form encode / query parse
 
 (ert-deftest emcp-test-form-roundtrip ()
